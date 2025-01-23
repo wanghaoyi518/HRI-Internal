@@ -78,12 +78,17 @@ class DataCollector:
 
         t = 0
         while t < duration:
-            # Check robot goal first
+            # Add early termination condition
+            human_dist = np.linalg.norm(human_state.physical_state[:2] - human_config.goal_pos)
+            human_speed = abs(human_state.physical_state[3])
             robot_dist = np.linalg.norm(robot_state[:2] - robot_config.goal_pos)
             robot_speed = abs(robot_state[3])
-            if robot_dist < 0.3 and robot_speed < 0.01:
-                break  # Stop simulation if robot has reached goal and stopped
-                
+            
+            # Stop if both agents are at their goals and nearly stopped
+            if (human_dist < 0.3 and human_speed < 0.1 and 
+                robot_dist < 0.3 and robot_speed < 0.1):
+                break
+
             internal_state = {
                 'attention': self._get_attention(t, attention_profile),
                 'style': self._get_style(t, style_profile)
@@ -132,7 +137,6 @@ class DataCollector:
         return demo
 
     def _get_robot_action(self, robot_state, human_state, goal):
-        """Goal-directed robot action with hard stopping behavior"""
         if robot_state is None or human_state is None or goal is None:
             return np.array([0.0, 0.0])
             
@@ -141,24 +145,33 @@ class DataCollector:
             current_speed = robot_state[3]
             
             # Very close to goal - force full stop
-            if dist_to_goal < 0.3:
-                return np.array([0.0, -3.0])  # Strong braking force
+            if dist_to_goal < 0.5:
+                return np.array([0.0, -4.0])  # Strong braking force
                 
+            # Compute relative position and velocity
+            rel_pos = robot_state[:2] - human_state[:2]
+            rel_dist = np.linalg.norm(rel_pos)
+            
+            robot_vel = current_speed * np.array([np.cos(robot_state[2]), np.sin(robot_state[2])])
+            human_vel = human_state[3] * np.array([np.cos(human_state[2]), np.sin(human_state[2])])
+            rel_vel = robot_vel - human_vel
+            rel_speed = np.linalg.norm(rel_vel)
+            
+            # Check if approaching
+            approaching = np.dot(rel_pos, rel_vel) < 0
+            
             # Approaching goal - aggressive speed reduction
-            if dist_to_goal < 1.0:
-                # Quadratic speed reduction for smoother deceleration
-                desired_speed = max(0.01, 0.2 * dist_to_goal * dist_to_goal)
+            if dist_to_goal < 2.0:
+                desired_speed = max(0.01, 0.1 * dist_to_goal * dist_to_goal)
                 
                 to_goal = goal - robot_state[:2]
                 desired_heading = np.arctan2(to_goal[1], to_goal[0])
                 heading_error = self._normalize_angle(desired_heading - robot_state[2])
                 
-                # Stronger steering when close to goal
                 steering = 3.0 * heading_error
                 
-                # Further reduce speed if not aligned with goal
                 if abs(heading_error) > 0.1:
-                    desired_speed *= 0.3
+                    desired_speed *= 0.2
                     
                 speed_error = desired_speed - current_speed
                 return np.array([steering, np.clip(speed_error, -2.0, 1.0)])
@@ -171,10 +184,20 @@ class DataCollector:
             steering = 2.0 * heading_error
             desired_speed = min(1.0, dist_to_goal)
             
-            # Safety around human
-            dist_to_human = np.linalg.norm(robot_state[:2] - human_state[:2])
-            if dist_to_human < 2.0:
-                desired_speed *= (dist_to_human / 2.0)
+            # Enhanced safety logic
+            if approaching and rel_dist < 4.0:
+                # Time to collision
+                ttc = rel_dist / (rel_speed + 1e-6)
+                
+                # Progressive braking based on distance and TTC
+                brake_factor = min(1.0, (rel_dist / 4.0) ** 2) * min(1.0, (ttc / 2.0) ** 2)
+                desired_speed *= brake_factor
+                
+                # Stronger braking for close distances
+                if rel_dist < 2.0:
+                    desired_speed *= 0.5
+                    if rel_dist < 1.0:
+                        desired_speed *= 0.3
             
             speed_error = desired_speed - current_speed
             return np.array([steering, np.clip(speed_error, -1.0, 1.0)])
@@ -183,54 +206,113 @@ class DataCollector:
             return np.array([0.0, 0.0])
 
     def _get_human_action(self, human_state, robot_state, internal_state, goal):
-        """Goal-directed human action with improved stopping behavior"""
         if human_state is None or robot_state is None or internal_state is None or goal is None:
             return np.array([0.0, 0.0])
-            
+        
         try:
+            # Extract states
             dist_to_goal = np.linalg.norm(goal - human_state[:2])
             current_speed = human_state[3]
+            attention = internal_state['attention']
+            style = internal_state['style']
             
-            # Very close to goal - stop
+            # Very close to goal - force stop regardless of style
             if dist_to_goal < 0.3:
-                return np.array([0.0, -2.0 * current_speed])
+                return np.array([0.0, -4.0 * current_speed])  # Strong brake
             
-            # Approaching goal - reduce speed
+            # Near goal - reduce speed and improve precision
             if dist_to_goal < 1.0:
-                desired_speed = max(0.05, 0.3 * dist_to_goal * dist_to_goal)
-                desired_speed *= (0.3 + 0.7 * internal_state['style'])
+                desired_speed = 0.2 * dist_to_goal  # Linear speed reduction
                 
                 to_goal = goal - human_state[:2]
                 desired_heading = np.arctan2(to_goal[1], to_goal[0])
                 heading_error = self._normalize_angle(desired_heading - human_state[2])
                 
-                steering = 3.0 * heading_error * (0.5 + 0.5 * internal_state['attention'])
+                # More precise steering near goal
+                steering = 2.0 * heading_error
+                
+                # Stop if headed wrong direction near goal
+                if abs(heading_error) > 0.5:
+                    desired_speed = 0.0
+                
+                return np.array([
+                    np.clip(steering, -1.0, 1.0),
+                    np.clip(-current_speed, -2.0, 1.0)  # Focus on stopping
+                ])
+            
+            # Normal navigation - rest of the existing logic
+            # Base parameters
+            max_speed = 1.0 + style
+            attention_factor = 0.3 + 0.7 * attention
+            
+            # Compute relative position and velocity
+            rel_pos = human_state[:2] - robot_state[:2]
+            rel_dist = np.linalg.norm(rel_pos)
+            
+            human_vel = current_speed * np.array([np.cos(human_state[2]), np.sin(human_state[2])])
+            robot_vel = robot_state[3] * np.array([np.cos(robot_state[2]), np.sin(robot_state[2])])
+            rel_vel = human_vel - robot_vel
+            rel_speed = np.linalg.norm(rel_vel)
+            
+            # Check if approaching
+            approaching = np.dot(rel_pos, rel_vel) < 0
+            
+            # Very close to goal - stop
+            if dist_to_goal < 0.3:
+                return np.array([0.0, -2.0 * current_speed * attention_factor])
+            
+            # Approaching goal
+            if dist_to_goal < 1.0:
+                desired_speed = max(0.05, 0.3 * dist_to_goal * dist_to_goal)
+                desired_speed *= (0.5 + 0.5 * style)
+                
+                to_goal = goal - human_state[:2]
+                desired_heading = np.arctan2(to_goal[1], to_goal[0])
+                heading_error = self._normalize_angle(desired_heading - human_state[2])
+                
+                steering = 3.0 * heading_error * attention_factor
                 
                 if abs(heading_error) > 0.1:
-                    desired_speed *= 0.3
+                    desired_speed *= 0.5
                 
                 speed_error = desired_speed - current_speed
-                return np.array([steering, np.clip(speed_error, -2.0, 1.0)])
+                return np.array([steering, np.clip(speed_error, -2.0, 1.0) * attention_factor])
             
             # Normal navigation
             to_goal = goal - human_state[:2]
             desired_heading = np.arctan2(to_goal[1], to_goal[0])
             heading_error = self._normalize_angle(desired_heading - human_state[2])
             
-            steering = 2.0 * heading_error * (0.5 + 0.5 * internal_state['attention'])
-            desired_speed = min(1.0, dist_to_goal) * (0.5 + 0.5 * internal_state['style'])
+            steering = 2.0 * heading_error * attention_factor * (0.5 + 0.5 * style)
+            desired_speed = min(max_speed, dist_to_goal) * (0.7 + 0.3 * style)
             
-            # Safety check
-            dist_to_robot = np.linalg.norm(human_state[:2] - robot_state[:2])
-            safe_dist = 2.0 / internal_state['attention']
-            
-            if dist_to_robot < safe_dist:
-                desired_speed *= (dist_to_robot / safe_dist)
+            # Enhanced safety logic based on attention
+            if approaching and rel_dist < 4.0 * (2.0 - attention):
+                # Time to collision
+                ttc = rel_dist / (rel_speed + 1e-6)
                 
-            speed_error = desired_speed - current_speed
-            return np.array([steering, np.clip(speed_error, -1.0, 1.0)])
+                # Progressive braking based on distance, TTC and attention
+                brake_dist = 4.0 * (2.0 - attention)
+                brake_factor = min(1.0, (rel_dist / brake_dist) ** 2) * min(1.0, (ttc / 2.0) ** 2)
+                desired_speed *= brake_factor * attention_factor
+                
+                # Extra caution for low attention
+                if attention < 0.5:
+                    desired_speed *= 0.7
+                
+                # Stronger braking for close distances
+                if rel_dist < 2.0:
+                    desired_speed *= 0.5 * attention_factor
+                    if rel_dist < 1.0:
+                        desired_speed *= 0.3
             
-        except:
+            speed_error = desired_speed - current_speed
+            acceleration = np.clip(speed_error, -1.0, 1.0) * attention_factor
+            
+            return np.array([np.clip(steering, -1.0, 1.0), acceleration])
+            
+        except Exception as e:
+            print(f"Error in human action computation: {e}")
             return np.array([0.0, 0.0])
 
     def _get_attention(self, t: float, profile: Dict) -> float:
@@ -264,10 +346,10 @@ class DataCollector:
         x, y, theta, v = human_state.physical_state
         steering, acceleration = action
         
-        dx = v * np.cos(theta) * self.dt
-        dy = v * np.sin(theta) * self.dt
-        dtheta = v * steering * self.dt
-        dv = acceleration * self.dt
+        dx = v * np.cos(theta)  # No dt needed since it's built into the dynamics
+        dy = v * np.sin(theta)
+        dtheta = steering  # Direct heading control
+        dv = acceleration * self.dt  # Only velocity change needs dt
         
         new_state = np.array([
             x + dx,
@@ -284,10 +366,10 @@ class DataCollector:
         x, y, theta, v = robot_state
         steering, acceleration = action
         
-        dx = v * np.cos(theta) * self.dt
-        dy = v * np.sin(theta) * self.dt
-        dtheta = v * steering * self.dt
-        dv = acceleration * self.dt
+        dx = v * np.cos(theta)  # No dt needed since it's built into the dynamics
+        dy = v * np.sin(theta)
+        dtheta = steering  # Direct heading control
+        dv = acceleration * self.dt  # Only velocity change needs dt
         
         return np.array([
             x + dx,
@@ -300,8 +382,18 @@ class DataCollector:
         """Save visualization of demonstration"""
         from utils.visualizer import TrajectoryVisualizer
         visualizer = TrajectoryVisualizer()
-        visualizer.plot_trajectory(demo, title, save_path)
         
+        # Save static plot and animation
         if save_path:
+            # Save PNG
+            visualizer.plot_trajectory(demo, title, save_path)
+            
+            # Save GIF
+            gif_path = save_path.replace('.png', '.gif')
+            visualizer.create_animation(demo, title, gif_path)
+            
+            # Save metrics
             metrics_path = save_path.replace('.png', '_metrics.png')
             visualizer.plot_metrics(demo, metrics_path)
+        else:
+            visualizer.plot_trajectory(demo, title)

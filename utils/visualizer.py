@@ -5,6 +5,7 @@ import numpy as np
 from typing import List, Dict
 from data.collector import Demonstration
 import matplotlib.patches as patches
+from matplotlib.animation import FuncAnimation, PillowWriter
 
 class TrajectoryVisualizer:
     """Visualizes human-robot interactions from demonstrations"""
@@ -19,6 +20,7 @@ class TrajectoryVisualizer:
             'robot_goal': '#660000',  # Dark red
             'boundary': 'gray'
         }
+        self.animation_interval = 50  # 50ms between frames
         
     def plot_trajectory(self, demo: Demonstration, title: str = None, save_path: str = None):
         """Plot complete trajectory visualization"""
@@ -66,7 +68,7 @@ class TrajectoryVisualizer:
         dt = times[1] - times[0]  # Get timestep
         steps_per_second = int(round(1.0/dt))
         
-        print("len(times): ", len(times))
+        print("total time", len(times)*dt)
         print("steps_per_second: ", steps_per_second)
         
         # Plot second markers with enhanced visibility
@@ -242,3 +244,97 @@ class TrajectoryVisualizer:
             plt.close()
         else:
             plt.show()
+            
+    def create_animation(self, demo: Demonstration, title: str = None, save_path: str = None):
+        """Create animated visualization of the interaction"""
+        fig = plt.figure(figsize=(10, 8))
+        ax = plt.gca()
+        
+        # Draw environment boundary
+        boundary = patches.Rectangle((0, 0), 10, 10, fill=False, 
+                                  color=self.colors['boundary'], 
+                                  linestyle='--', alpha=0.5)
+        ax.add_patch(boundary)
+        
+        # Set plot properties
+        ax.set_xlim(-0.5, 10.5)
+        ax.set_ylim(-0.5, 10.5)
+        ax.grid(True, alpha=0.3)
+        ax.set_aspect('equal')
+        if title:
+            ax.set_title(title)
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Y Position (m)')
+        
+        # Extract data
+        human_traj = np.array(demo.states)
+        robot_traj = np.array(demo.robot_states)
+        
+        # Plot goals
+        if demo.scenario_info:
+            human_goal = demo.scenario_info['human_goal']
+            robot_goal = demo.scenario_info['robot_goal']
+            ax.scatter(human_goal[0], human_goal[1], 
+                      color=self.colors['human_goal'], s=200, marker='*',
+                      label='Human Goal', zorder=5)
+            ax.scatter(robot_goal[0], robot_goal[1], 
+                      color=self.colors['robot_goal'], s=200, marker='*',
+                      label='Robot Goal', zorder=5)
+        
+        # Initialize empty line objects
+        human_line, = ax.plot([], [], color=self.colors['human'], 
+                            label='Human', alpha=0.7, linewidth=2)
+        robot_line, = ax.plot([], [], color=self.colors['robot'], 
+                            label='Robot', alpha=0.7, linewidth=2)
+        human_pos = ax.scatter([], [], color=self.colors['human'], 
+                             s=100, zorder=6)
+        robot_pos = ax.scatter([], [], color=self.colors['robot'], 
+                             s=100, zorder=6)
+        
+        # Add legend
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1),
+                 ncol=3, fancybox=True, shadow=True)
+        
+        def init():
+            """Initialize animation"""
+            human_line.set_data([], [])
+            robot_line.set_data([], [])
+            human_pos.set_offsets(np.empty((0, 2)))
+            robot_pos.set_offsets(np.empty((0, 2)))
+            return human_line, robot_line, human_pos, robot_pos
+        
+        def animate(frame):
+            """Animation update function"""
+            # Update trajectories up to current frame
+            human_line.set_data(human_traj[:frame+1, 0], human_traj[:frame+1, 1])
+            robot_line.set_data(robot_traj[:frame+1, 0], robot_traj[:frame+1, 1])
+            
+            # Update current positions
+            human_pos.set_offsets(human_traj[frame:frame+1, :2])
+            robot_pos.set_offsets(robot_traj[frame:frame+1, :2])
+            
+            return human_line, robot_line, human_pos, robot_pos
+        
+        # Create animation
+        anim = FuncAnimation(fig, animate, init_func=init,
+                           frames=len(human_traj), 
+                           interval=self.animation_interval,
+                           blit=True)
+        
+        if save_path:
+            # Save as GIF
+            writer = PillowWriter(fps=1000/self.animation_interval)
+            anim.save(save_path, writer=writer)
+            plt.close()
+        else:
+            plt.show()
+            
+    def save_demonstration_plot(self, demo: Demonstration, title: str = None, save_path: str = None):
+        """Save both static plot and animation"""
+        # Save static plot
+        self.plot_trajectory(demo, title, save_path)
+        
+        # Save animation if save_path is provided
+        if save_path:
+            gif_path = save_path.replace('.png', '.gif')
+            self.create_animation(demo, title, gif_path)
